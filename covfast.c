@@ -5,9 +5,9 @@
  *
  * Description:  Calculates template-based coverage for genomic regions.
  *
- * Version:  1.2
+ * Version:  1.3
  * Created:  08/07/2024
- * Revision:  2
+ * Revision:  3
  * Compiler:  gcc
  *
  * Author:  dspencer
@@ -40,6 +40,7 @@
  * --reference <ref.fa>    The reference genome FASTA file, required for CRAM.
  * Must be indexed with 'samtools faidx'. [Required]
  * --outfile <out.tsv>     Output file for statistics. [Default: stdout]
+ * --threads, -t <int>     Number of threads for CRAM/BAM decompression. [Default: 1]
  * --minmapqual, -q <int>  Minimum mapping quality. [Default: 1]
  * --minbasequal, -Q <int> Minimum base quality. [Default: 13]
  * --coverage_values <str> Comma-separated coverage thresholds.
@@ -80,6 +81,7 @@ typedef struct {
     int min_baseq;
     int n_cov_values;
     int cov_values[MAX_COV_VALUES];
+    int threads; // Number of threads for I/O
 } args_t;
 
 void print_usage(char *prog_name) {
@@ -91,6 +93,7 @@ void print_usage(char *prog_name) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -r, --reference <file>    The reference genome FASTA file, required for CRAM.\n");
     fprintf(stderr, "  -o, --outfile <file>      Output file for statistics. [Default: stdout]\n");
+    fprintf(stderr, "  -t, --threads <int>       Number of threads for CRAM/BAM decompression. [Default: 1]\n");
     fprintf(stderr, "  -q, --minmapqual <int>    Minimum mapping quality. [Default: 1]\n");
     fprintf(stderr, "  -Q, --minbasequal <int>   Minimum base quality. [Default: 13]\n");
     fprintf(stderr, "  -c, --coverage_values <str> Comma-separated coverage thresholds for summary stats.\n");
@@ -310,14 +313,16 @@ int main(int argc, char *argv[]) {
     args_t args;
     memset(&args, 0, sizeof(args));
 
-    // Default coverage values
+    // Default values
     char cov_values_str[256] = "10,20,40,60,100,250,500,1000,1250,2500,4000";
     args.min_mapq = 1;
     args.min_baseq = 13;
+    args.threads = 1; // Default to 1 thread
 
     static struct option long_options[] = {
         {"reference",       required_argument, 0, 'r'},
         {"outfile",         required_argument, 0, 'o'},
+        {"threads",         required_argument, 0, 't'},
         {"minmapqual",      required_argument, 0, 'q'},
         {"minbasequal",     required_argument, 0, 'Q'},
         {"coverage_values", required_argument, 0, 'c'},
@@ -326,10 +331,11 @@ int main(int argc, char *argv[]) {
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "r:o:q:Q:c:h", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "r:o:t:q:Q:c:h", long_options, NULL)) != -1) {
         switch (c) {
             case 'r': args.reference = optarg; break;
             case 'o': args.outfile = optarg; break;
+            case 't': args.threads = atoi(optarg); break;
             case 'q': args.min_mapq = atoi(optarg); break;
             case 'Q': args.min_baseq = atoi(optarg); break;
             case 'c': strncpy(cov_values_str, optarg, sizeof(cov_values_str)-1); break;
@@ -367,6 +373,11 @@ int main(int argc, char *argv[]) {
     if (!in) {
         fprintf(stderr, "ERROR: Cannot open CRAM/BAM file %s\n", args.cram_file);
         return 1;
+    }
+
+    // --- Set number of threads for CRAM/BAM decompression ---
+    if (args.threads > 1) {
+        hts_set_threads(in, args.threads);
     }
 
     // Read header

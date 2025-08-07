@@ -4,7 +4,7 @@
 # --- Configuration ---
 # Compiler and flags
 CC = gcc
-CFLAGS = -g -Wall -O2
+CFLAGS = -Wall -O3 -march=native
 # Add the local htslib directory to the include path
 CPPFLAGS = -I./htslib
 # Link against the static htslib library directly, and its dependencies
