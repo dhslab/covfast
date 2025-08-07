@@ -5,9 +5,9 @@
  *
  * Description:  Calculates template-based coverage for genomic regions.
  *
- * Version:  1.3
+ * Version:  0.3
  * Created:  08/07/2024
- * Revision:  3
+ * Revision:  5
  * Compiler:  gcc
  *
  * Author:  dspencer
@@ -45,6 +45,7 @@
  * --minbasequal, -Q <int> Minimum base quality. [Default: 13]
  * --coverage_values <str> Comma-separated coverage thresholds.
  * --help, -h              Show this help message and exit.
+ * --version, -v           Show version number and exit.
  *
  * DEPENDENCIES:
  * - htslib (version 1.12 or later recommended).
@@ -67,6 +68,8 @@
 #include <htslib/kstring.h>
 #include <htslib/hts_defs.h>
 #include <htslib/khash.h>
+
+#define COVFAST_VERSION "0.3"
 
 // Max coverage thresholds we can store
 #define MAX_COV_VALUES 50
@@ -97,7 +100,8 @@ void print_usage(char *prog_name) {
     fprintf(stderr, "  -q, --minmapqual <int>    Minimum mapping quality. [Default: 1]\n");
     fprintf(stderr, "  -Q, --minbasequal <int>   Minimum base quality. [Default: 13]\n");
     fprintf(stderr, "  -c, --coverage_values <str> Comma-separated coverage thresholds for summary stats.\n");
-    fprintf(stderr, "  -h, --help                Show this help message and exit.\n\n");
+    fprintf(stderr, "  -h, --help                Show this help message and exit.\n");
+    fprintf(stderr, "  -v, --version             Show version number and exit.\n\n");
 }
 
 
@@ -327,11 +331,12 @@ int main(int argc, char *argv[]) {
         {"minbasequal",     required_argument, 0, 'Q'},
         {"coverage_values", required_argument, 0, 'c'},
         {"help",            no_argument,       0, 'h'},
+        {"version",         no_argument,       0, 'v'},
         {0, 0, 0, 0}
     };
 
     int c;
-    while ((c = getopt_long(argc, argv, "r:o:t:q:Q:c:h", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "r:o:t:q:Q:c:hv", long_options, NULL)) != -1) {
         switch (c) {
             case 'r': args.reference = optarg; break;
             case 'o': args.outfile = optarg; break;
@@ -341,6 +346,9 @@ int main(int argc, char *argv[]) {
             case 'c': strncpy(cov_values_str, optarg, sizeof(cov_values_str)-1); break;
             case 'h':
                 print_usage(argv[0]);
+                return 0;
+            case 'v':
+                printf("covfast version %s\n", COVFAST_VERSION);
                 return 0;
             default:
                 print_usage(argv[0]);
@@ -437,6 +445,11 @@ int main(int argc, char *argv[]) {
     }
     fprintf(outfp, "\n");
 
+    // --- Initialize reusable memory buffers ---
+    uint32_t *coverage = NULL;
+    int64_t coverage_buf_size = 0;
+    khash_t(read2cov) *hmap = kh_init(read2cov);
+
     // --------------------------------------------------------------------
     // Process each BED line
     char linebuf[8192];
@@ -458,27 +471,27 @@ int main(int argc, char *argv[]) {
         }
 
         // BED is 0-based, htslib iterator is 0-based. No conversion needed.
-        // The final output will convert start back to 1-based for convention.
         int64_t region_len = end - start;
         if (region_len <= 0) {
             continue;
         }
 
-        // Allocate final coverage array for [start, end)
-        uint32_t *coverage = (uint32_t *)calloc(region_len, sizeof(uint32_t));
-        if (!coverage) {
-            fprintf(stderr, "ERROR: coverage calloc failed (region_len=%" PRId64 ")\n", region_len);
-            continue;
+        // --- Reuse or reallocate the coverage buffer ---
+        if (region_len > coverage_buf_size) {
+            coverage_buf_size = region_len;
+            coverage = (uint32_t *)realloc(coverage, coverage_buf_size * sizeof(uint32_t));
+            if (!coverage) {
+                fprintf(stderr, "ERROR: coverage realloc failed\n");
+                exit(1); // Critical memory failure
+            }
         }
+        // Always clear the buffer for the current region
+        memset(coverage, 0, region_len * sizeof(uint32_t));
 
-        // Setup a hash: read_name -> read_cov_t*
-        khash_t(read2cov) *hmap = kh_init(read2cov);
 
         int tid = bam_name2id(hdr, chrom);
         if (tid < 0) {
             fprintf(stderr, "Warning: Chromosome '%s' not found in CRAM header. Skipping region.\n", chrom);
-            free(coverage);
-            kh_destroy(read2cov, hmap);
             continue;
         }
 
@@ -532,31 +545,34 @@ int main(int argc, char *argv[]) {
         for (khiter_t k2 = kh_begin(hmap); k2 != kh_end(hmap); ++k2) {
             if (!kh_exist(hmap, k2)) continue;
             read_cov_t *rc = kh_value(hmap, k2);
-            if (!rc) continue;
             for (int64_t i = 0; i < rc->len; i++) {
                 if (rc->cov_mask[i]) {
                     coverage[i]++;
                 }
             }
-            free(rc->cov_mask);
-            free(rc);
-
-            // Because we used strdup on the read_name as the key,
-            // we should free that key as well
-            free((char*)kh_key(hmap, k2));
         }
-        kh_destroy(read2cov, hmap);
-
+        
         // Compute coverage stats and print
         compute_and_print_stats(chrom, start, end, gene, info,
                                 coverage, region_len,
                                 args.cov_values, args.n_cov_values,
                                 outfp);
 
-        free(coverage);
+        // --- Clear the hash map for the next region ---
+        for (khiter_t k2 = kh_begin(hmap); k2 != kh_end(hmap); ++k2) {
+            if (kh_exist(hmap, k2)) {
+                read_cov_t *rc = kh_value(hmap, k2);
+                free(rc->cov_mask);
+                free(rc);
+                free((char*)kh_key(hmap, k2));
+            }
+        }
+        kh_clear(read2cov, hmap);
     }
 
     // Cleanup
+    free(coverage);
+    kh_destroy(read2cov, hmap);
     if (outfp && outfp != stdout) fclose(outfp);
     bgzf_close(bedfp);
     hts_idx_destroy(idx);
