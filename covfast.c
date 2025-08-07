@@ -5,9 +5,9 @@
  *
  * Description:  Calculates template-based coverage for genomic regions.
  *
- * Version:  0.4
+ * Version:  0.6
  * Created:  08/07/2024
- * Revision:  6
+ * Revision:  7
  * Compiler:  gcc
  *
  * Author:  dspencer
@@ -69,7 +69,7 @@
 #include <htslib/hts_defs.h>
 #include <htslib/khash.h>
 
-#define COVFAST_VERSION "0.4"
+#define COVFAST_VERSION "0.6"
 
 // Max coverage thresholds we can store
 #define MAX_COV_VALUES 50
@@ -256,7 +256,7 @@ void compute_and_print_stats(const char *chrom, int64_t start, int64_t end,
     // Sort for Q1, median, Q3
     uint32_t *sorted = (uint32_t *)malloc(region_len * sizeof(uint32_t));
     if (!sorted) {
-        fprintf(stderr, "ERROR: Memory allocation failed\n");
+        fprintf(stderr, "ERROR: Memory allocation failed for sorted array\n");
         return;
     }
     memcpy(sorted, coverage, region_len * sizeof(uint32_t));
@@ -278,7 +278,7 @@ void compute_and_print_stats(const char *chrom, int64_t start, int64_t end,
     double *pct_above = (double *)calloc(n_cov_values, sizeof(double));
     if (!pct_above) {
         free(sorted);
-        fprintf(stderr, "ERROR: Memory allocation failed\n");
+        fprintf(stderr, "ERROR: Memory allocation failed for pct_above array\n");
         return;
     }
 
@@ -499,7 +499,6 @@ int main(int argc, char *argv[]) {
         hts_itr_t *iter = sam_itr_queryi(idx, tid, start, end);
         if (!iter) {
             // This is not an error; it just means no reads are in the region.
-            // We'll process it to output a line of zeros.
         }
 
         // This bitmask contains all the flags we want to skip
@@ -509,20 +508,14 @@ int main(int argc, char *argv[]) {
         bam1_t *b = bam_init1();
         if (iter) {
             while (sam_itr_next(in, iter, b) >= 0) {
-
-                // --- READ FLAG CHECK ---
-                if (b->core.flag & flags_to_skip) {
-                    continue;
-                }
+                if (b->core.flag & flags_to_skip) continue;
 
                 const char *read_name = bam_get_qname(b);
                 if (!read_name) continue;
 
-                // Insert or find existing entry in the hash
                 int ret;
                 khiter_t k = kh_put(read2cov, hmap, strdup(read_name), &ret);
 
-                // If ret != 0, it's a new entry and we must allocate a new read_cov_t.
                 if (ret != 0) {
                     read_cov_t *rc = (read_cov_t*)calloc(1, sizeof(read_cov_t));
                     rc->start   = start;
@@ -532,7 +525,6 @@ int main(int argc, char *argv[]) {
                     kh_value(hmap, k) = rc;
                 }
 
-                // Now add coverage from this read
                 read_cov_t *rc = kh_value(hmap, k);
                 add_read_coverage(b, rc, args.min_mapq, args.min_baseq);
             }
@@ -541,23 +533,28 @@ int main(int argc, char *argv[]) {
         bam_destroy1(b);
         if (iter) hts_itr_destroy(iter);
 
-        // --- Finalize coverage and clear the hash map in a single loop ---
+        // --- Finalize coverage (Pass 1) ---
         for (khiter_t k2 = kh_begin(hmap); k2 != kh_end(hmap); ++k2) {
             if (kh_exist(hmap, k2)) {
                 read_cov_t *rc = kh_value(hmap, k2);
-                // Add this read's coverage mask to the final coverage array
                 for (int64_t i = 0; i < rc->len; i++) {
                     if (rc->cov_mask[i]) {
                         coverage[i]++;
                     }
                 }
-                // Free the memory for this hash entry immediately
+            }
+        }
+
+        // --- Free hash map contents (Pass 2) ---
+        for (khiter_t k2 = kh_begin(hmap); k2 != kh_end(hmap); ++k2) {
+            if (kh_exist(hmap, k2)) {
+                read_cov_t *rc = kh_value(hmap, k2);
                 free(rc->cov_mask);
                 free(rc);
                 free((char*)kh_key(hmap, k2));
             }
         }
-        kh_clear(read2cov, hmap);
+        kh_clear(read2cov, hmap); // Reset the hash map for the next region
         
         // Compute coverage stats and print
         compute_and_print_stats(chrom, start, end, gene, info,
