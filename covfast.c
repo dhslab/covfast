@@ -5,9 +5,9 @@
  *
  * Description:  Calculates template-based coverage for genomic regions.
  *
- * Version:  0.3
+ * Version:  0.4
  * Created:  08/07/2024
- * Revision:  5
+ * Revision:  6
  * Compiler:  gcc
  *
  * Author:  dspencer
@@ -69,7 +69,7 @@
 #include <htslib/hts_defs.h>
 #include <htslib/khash.h>
 
-#define COVFAST_VERSION "0.3"
+#define COVFAST_VERSION "0.4"
 
 // Max coverage thresholds we can store
 #define MAX_COV_VALUES 50
@@ -541,33 +541,29 @@ int main(int argc, char *argv[]) {
         bam_destroy1(b);
         if (iter) hts_itr_destroy(iter);
 
-        // Now finalize coverage.
-        for (khiter_t k2 = kh_begin(hmap); k2 != kh_end(hmap); ++k2) {
-            if (!kh_exist(hmap, k2)) continue;
-            read_cov_t *rc = kh_value(hmap, k2);
-            for (int64_t i = 0; i < rc->len; i++) {
-                if (rc->cov_mask[i]) {
-                    coverage[i]++;
-                }
-            }
-        }
-        
-        // Compute coverage stats and print
-        compute_and_print_stats(chrom, start, end, gene, info,
-                                coverage, region_len,
-                                args.cov_values, args.n_cov_values,
-                                outfp);
-
-        // --- Clear the hash map for the next region ---
+        // --- Finalize coverage and clear the hash map in a single loop ---
         for (khiter_t k2 = kh_begin(hmap); k2 != kh_end(hmap); ++k2) {
             if (kh_exist(hmap, k2)) {
                 read_cov_t *rc = kh_value(hmap, k2);
+                // Add this read's coverage mask to the final coverage array
+                for (int64_t i = 0; i < rc->len; i++) {
+                    if (rc->cov_mask[i]) {
+                        coverage[i]++;
+                    }
+                }
+                // Free the memory for this hash entry immediately
                 free(rc->cov_mask);
                 free(rc);
                 free((char*)kh_key(hmap, k2));
             }
         }
         kh_clear(read2cov, hmap);
+        
+        // Compute coverage stats and print
+        compute_and_print_stats(chrom, start, end, gene, info,
+                                coverage, region_len,
+                                args.cov_values, args.n_cov_values,
+                                outfp);
     }
 
     // Cleanup
