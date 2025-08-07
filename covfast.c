@@ -5,12 +5,12 @@
  *
  * Description:  Calculates template-based coverage for genomic regions.
  *
- * Version:  0.6
+ * Version:  0.5
  * Created:  08/07/2024
- * Revision:  7
+ * Revision:  12
  * Compiler:  gcc
  *
- * Author:  dspencer
+ * Author:  David H. Spencer
  *
  * =====================================================================================
  *
@@ -19,15 +19,12 @@
  * PURPOSE:
  * This program calculates depth of coverage statistics for specified genomic
  * regions from a CRAM or BAM file. It is designed to calculate "template"
- * coverage, meaning that for a given read pair (template), any overlapping
- * bases between the two reads are counted only once. This provides a measure
- * of unique fragment coverage, which can be more accurate for certain
- * applications than the standard alignment-based coverage calculated by tools
- * like 'samtools mpileup'.
+ * coverage by merging the coverage from read pairs, ensuring that overlapping
+ * bases are counted only once. This is achieved using a memory-efficient
+ * interval-based algorithm that is robust for very large regions.
  *
- * The program mimics the filtering and coverage logic of 'samtools mpileup',
- * including counting deletions and reference skips (N CIGAR operations) as
- * covered, to provide a comparable result.
+ * The program's filtering logic is designed to be comparable to standard tools
+ * like 'samtools depth -s'.
  *
  * USAGE:
  * ./covfast [OPTIONS] <bed_file> <cram_or_bam_file>
@@ -48,7 +45,7 @@
  * --version, -v           Show version number and exit.
  *
  * DEPENDENCIES:
- * - htslib (version 1.12 or later recommended).
+ * - htslib (version 1.21 or later recommended).
  *
  * =====================================================================================
  */
@@ -69,7 +66,7 @@
 #include <htslib/hts_defs.h>
 #include <htslib/khash.h>
 
-#define COVFAST_VERSION "0.6"
+#define COVFAST_VERSION "0.5"
 
 // Max coverage thresholds we can store
 #define MAX_COV_VALUES 50
@@ -152,84 +149,135 @@ int cmp_uint32_t(const void *a, const void *b) {
 }
 
 /* --------------------------------------------------------------------------
-   READ-BASED COVERAGE LOGIC
-   We use a hash to collect partial coverage masks for each read name, ensuring
-   that if two mates overlap, their union is counted exactly once.
+   READ-BASED COVERAGE LOGIC (INTERVAL-BASED)
    -------------------------------------------------------------------------- */
 
-// A struct to store coverage for one read name (template) within [region_start, region_end).
+// A single covered interval [start, end)
 typedef struct {
-    int64_t start;         // region start
-    int64_t end;           // region end
-    int64_t len;           // end - start
-    char   *cov_mask;      // cov_mask[i] = 1 if read covers (start + i), else 0
+    int64_t start;
+    int64_t end;
+} cov_interval_t;
+
+// A dynamic array of intervals for a single read template
+typedef struct {
+    size_t count;
+    size_t capacity;
+    cov_interval_t *intervals;
 } read_cov_t;
 
 // Create a hash from read-name -> read_cov_t*
 KHASH_MAP_INIT_STR(read2cov, read_cov_t*)
 
+// Comparison function for sorting intervals
+int cmp_intervals(const void *a, const void *b) {
+    const cov_interval_t *i1 = (const cov_interval_t *)a;
+    const cov_interval_t *i2 = (const cov_interval_t *)b;
+    if (i1->start < i2->start) return -1;
+    if (i1->start > i2->start) return 1;
+    return 0;
+}
+
+// Add a new interval to a read_cov_t struct
+void add_interval(read_cov_t *rc, int64_t start, int64_t end) {
+    if (start >= end) return; // Don't add empty intervals
+    if (rc->count >= rc->capacity) {
+        rc->capacity = rc->capacity == 0 ? 4 : rc->capacity * 2;
+        rc->intervals = (cov_interval_t *)realloc(rc->intervals, rc->capacity * sizeof(cov_interval_t));
+    }
+    rc->intervals[rc->count].start = start;
+    rc->intervals[rc->count].end = end;
+    rc->count++;
+}
+
+// Merge sorted, overlapping intervals in place
+void merge_intervals_inplace(read_cov_t *rc) {
+    if (rc->count <= 1) return;
+
+    qsort(rc->intervals, rc->count, sizeof(cov_interval_t), cmp_intervals);
+
+    size_t merged_idx = 0;
+    for (size_t i = 1; i < rc->count; i++) {
+        // If current interval overlaps with or is adjacent to the last merged one, extend it
+        if (rc->intervals[i].start <= rc->intervals[merged_idx].end) {
+            if (rc->intervals[i].end > rc->intervals[merged_idx].end) {
+                rc->intervals[merged_idx].end = rc->intervals[i].end;
+            }
+        } else {
+            // No overlap, move to the next interval
+            merged_idx++;
+            rc->intervals[merged_idx] = rc->intervals[i];
+        }
+    }
+    rc->count = merged_idx + 1;
+}
+
 /*
- * add_read_coverage():
- * Given a single read, fill in rc->cov_mask for the bases that pass mapQ/baseQ
- * and align within [rc->start, rc->end).  This function does a CIGAR walk to
- * find matched reference positions. For each matched base, check base quality
- * and set cov_mask[pos - start] = 1 if it passes.
+ * generate_read_intervals():
+ * Creates a new read_cov_t struct containing the coverage intervals for a
+ * single read, respecting the base quality filter.
  */
-static void add_read_coverage(const bam1_t *b, read_cov_t *rc, int min_mapq, int min_baseq) {
+read_cov_t* generate_read_intervals(const bam1_t *b, int min_mapq, int min_baseq) {
     const bam1_core_t *c = &b->core;
 
-    // If the read's mapping quality is below min_mapq, skip entirely.
-    if (c->qual < min_mapq) return;
-
-    // Get base qualities
+    read_cov_t *rc = (read_cov_t *)calloc(1, sizeof(read_cov_t));
     uint8_t *bq = bam_get_qual(b);
-
-    // Start the CIGAR parsing
     uint32_t *cigar = bam_get_cigar(b);
-    int64_t refpos = c->pos;  // reference position at start of this read alignment (0-based)
-    int readpos = 0;          // read offset (0-based)
+    int64_t refpos = c->pos;
+    int readpos = 0;
+    int64_t block_start = -1;
 
     for (int i = 0; i < c->n_cigar; i++) {
-        int op  = bam_cigar_op(cigar[i]);
-        int ol  = bam_cigar_oplen(cigar[i]);
+        int op = bam_cigar_op(cigar[i]);
+        int ol = bam_cigar_oplen(cigar[i]);
 
         if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
-            // For each matched base, check baseQ, possibly set coverage
             for (int j = 0; j < ol; j++) {
-                int64_t rpos = refpos + j;
-                int rp = readpos + j;  // read offset for this base
-                if (rp < 0 || rp >= c->l_qseq) continue; // sanity check
-
-                if (bq[rp] >= min_baseq) {
-                    if (rpos >= rc->start && rpos < rc->end) {
-                        int64_t idx = rpos - rc->start;
-                        rc->cov_mask[idx] = 1;
+                int rp = readpos + j;
+                // Check if base quality passes
+                if (rp >= 0 && rp < c->l_qseq && bq[rp] >= min_baseq) {
+                    // If we are not in a block, start a new one
+                    if (block_start == -1) {
+                        block_start = refpos + j;
+                    }
+                } else {
+                    // Base quality failed, end the current block if there is one
+                    if (block_start != -1) {
+                        add_interval(rc, block_start, refpos + j);
+                        block_start = -1;
                     }
                 }
             }
-            refpos  += ol;
-            readpos += ol;
-        }
-        else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
-            // Deletion or reference skip. Count this as covered, similar to mpileup
-            // Note: There is no base quality to check for a deleted base.
-            for (int j = 0; j < ol; j++) {
-                int64_t rpos = refpos + j;
-                if (rpos >= rc->start && rpos < rc->end) {
-                    int64_t idx = rpos - rc->start;
-                    rc->cov_mask[idx] = 1;
-                }
-            }
             refpos += ol;
-        }
-        else if (op == BAM_CINS || op == BAM_CSOFT_CLIP) {
-            // Insertion or soft clip: consumes read bases, but not reference
+            readpos += ol;
+        } else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
+            // End any existing block of matches
+            if (block_start != -1) {
+                add_interval(rc, block_start, refpos);
+                block_start = -1;
+            }
+            // Deletions and ref skips do not contribute to coverage in a base-quality
+            // sensitive model, as they have no base quality. Just advance refpos.
+            refpos += ol;
+        } else if (op == BAM_CINS || op == BAM_CSOFT_CLIP) {
+            // End any existing block, as these ops break contiguity on the reference
+            if (block_start != -1) {
+                add_interval(rc, block_start, refpos);
+                block_start = -1;
+            }
             readpos += ol;
         }
-        // BAM_CHARD_CLIP, BAM_CPAD, etc. do not consume either
-        // so we do nothing for them.
     }
+    // Add the last block if the read ends with matches
+    if (block_start != -1) {
+        add_interval(rc, block_start, refpos);
+    }
+    
+    // Merge any adjacent or overlapping intervals created during the process
+    merge_intervals_inplace(rc);
+    
+    return rc;
 }
+
 
 /* --------------------------------------------------------------------------
    COVERAGE STATISTICS
@@ -241,7 +289,6 @@ void compute_and_print_stats(const char *chrom, int64_t start, int64_t end,
                              FILE *outfp) {
     if (region_len <= 0) return;
 
-    // Sum, min, max
     uint64_t sum_cov = 0;
     uint32_t min_cov = (uint32_t)(-1);
     uint32_t max_cov = 0;
@@ -253,7 +300,6 @@ void compute_and_print_stats(const char *chrom, int64_t start, int64_t end,
     }
     double mean_cov = (double)sum_cov / (double)region_len;
 
-    // Sort for Q1, median, Q3
     uint32_t *sorted = (uint32_t *)malloc(region_len * sizeof(uint32_t));
     if (!sorted) {
         fprintf(stderr, "ERROR: Memory allocation failed for sorted array\n");
@@ -274,7 +320,6 @@ void compute_and_print_stats(const char *chrom, int64_t start, int64_t end,
         q3     = (double)sorted[idx_q3];
     }
 
-    // Compute percentage above thresholds
     double *pct_above = (double *)calloc(n_cov_values, sizeof(double));
     if (!pct_above) {
         free(sorted);
@@ -294,10 +339,8 @@ void compute_and_print_stats(const char *chrom, int64_t start, int64_t end,
         pct_above[j] = 100.0 * pct_above[j] / (double)region_len;
     }
 
-    // Print (tab-delimited)
-    // Note: The internal 'start' is 0-based. We print start+1 to match 1-based BED convention.
     fprintf(outfp, "%s\t%" PRId64 "\t%" PRId64 "\t%s\t%s\t%" PRIu64 "\t%.1f\t%.1f\t%.1f\t%.1f\t%u\t%u",
-            chrom, start + 1, end, gene, info,
+            chrom, start, end, gene, info,
             sum_cov, mean_cov, q1, median, q3, min_cov, max_cov);
     for (int j = 0; j < n_cov_values; j++) {
         fprintf(outfp, "\t%.1f", pct_above[j]);
@@ -312,16 +355,13 @@ void compute_and_print_stats(const char *chrom, int64_t start, int64_t end,
    MAIN
    -------------------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
-    // --------------------------------------------------------------------
-    // Argument parsing
     args_t args;
     memset(&args, 0, sizeof(args));
 
-    // Default values
     char cov_values_str[256] = "10,20,40,60,100,250,500,1000,1250,2500,4000";
     args.min_mapq = 1;
     args.min_baseq = 13;
-    args.threads = 1; // Default to 1 thread
+    args.threads = 1;
 
     static struct option long_options[] = {
         {"reference",       required_argument, 0, 'r'},
@@ -344,19 +384,12 @@ int main(int argc, char *argv[]) {
             case 'q': args.min_mapq = atoi(optarg); break;
             case 'Q': args.min_baseq = atoi(optarg); break;
             case 'c': strncpy(cov_values_str, optarg, sizeof(cov_values_str)-1); break;
-            case 'h':
-                print_usage(argv[0]);
-                return 0;
-            case 'v':
-                printf("covfast version %s\n", COVFAST_VERSION);
-                return 0;
-            default:
-                print_usage(argv[0]);
-                return 1;
+            case 'h': print_usage(argv[0]); return 0;
+            case 'v': printf("covfast version %s\n", COVFAST_VERSION); return 0;
+            default: print_usage(argv[0]); return 1;
         }
     }
 
-    // Check for positional arguments
     if (optind + 2 > argc) {
         fprintf(stderr, "Error: Missing positional arguments: <bed_file> and <cram_file>\n");
         print_usage(argv[0]);
@@ -365,30 +398,24 @@ int main(int argc, char *argv[]) {
     args.bed_file = argv[optind];
     args.cram_file = argv[optind + 1];
 
-    // Check for required reference argument
     if (!args.reference) {
         fprintf(stderr, "Error: --reference is a required argument.\n");
         print_usage(argv[0]);
         return 1;
     }
 
-    // Parse coverage thresholds
     args.n_cov_values = parse_coverage_values(cov_values_str, args.cov_values, MAX_COV_VALUES);
 
-    // --------------------------------------------------------------------
-    // Open CRAM/BAM
     samFile *in = sam_open(args.cram_file, "r");
     if (!in) {
         fprintf(stderr, "ERROR: Cannot open CRAM/BAM file %s\n", args.cram_file);
         return 1;
     }
 
-    // --- Set number of threads for CRAM/BAM decompression ---
     if (args.threads > 1) {
         hts_set_threads(in, args.threads);
     }
 
-    // Read header
     bam_hdr_t *hdr = sam_hdr_read(in);
     if (!hdr) {
         fprintf(stderr, "ERROR: Cannot read header from %s\n", args.cram_file);
@@ -396,7 +423,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Set reference if given (important for CRAM or to enable ref-based checks)
     if (hts_set_fai_filename(in, args.reference) != 0) {
         fprintf(stderr, "ERROR: Failed to set reference %s\n", args.reference);
         bam_hdr_destroy(hdr);
@@ -404,7 +430,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Load index
     hts_idx_t *idx = sam_index_load(in, args.cram_file);
     if (!idx) {
         fprintf(stderr, "ERROR: Cannot load index for %s\n", args.cram_file);
@@ -413,8 +438,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // --------------------------------------------------------------------
-    // Open BED file
     BGZF *bedfp = bgzf_open(args.bed_file, "r");
     if (!bedfp) {
         fprintf(stderr, "ERROR: Could not open BED file %s\n", args.bed_file);
@@ -424,7 +447,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Open outfile or use stdout
     FILE *outfp = stdout;
     if (args.outfile && strcmp(args.outfile, "-") != 0) {
         outfp = fopen(args.outfile, "w");
@@ -438,31 +460,22 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // Print header line
     fprintf(outfp, "#chrom\tstart\tend\tgene\tinfo\ttotal_cvg\tmean_cvg\tQ1_cvg\tmedian_cvg\tQ3_cvg\tmin_cvg\tmax_cvg");
     for (int i = 0; i < args.n_cov_values; i++) {
         fprintf(outfp, "\tpct_above_%d", args.cov_values[i]);
     }
     fprintf(outfp, "\n");
 
-    // --- Initialize reusable memory buffers ---
     uint32_t *coverage = NULL;
     int64_t coverage_buf_size = 0;
     khash_t(read2cov) *hmap = kh_init(read2cov);
 
-    // --------------------------------------------------------------------
-    // Process each BED line
     char linebuf[8192];
     while (read_bed_line(bedfp, linebuf, sizeof(linebuf))) {
-        // Skip comments or empty lines
-        if (linebuf[0] == '#' || strlen(linebuf) < 5) {
-            continue;
-        }
+        if (linebuf[0] == '#' || strlen(linebuf) < 5) continue;
 
-        // Expected format: chrom start end [gene] [info]
         char chrom[256], gene[256] = "N/A", info[256] = "N/A";
         int64_t start, end;
-        // Use sscanf to be robust to missing optional fields
         int items_scanned = sscanf(linebuf, "%255s %" SCNd64 " %" SCNd64 " %255s %255s",
                                    chrom, &start, &end, gene, info);
         if (items_scanned < 3) {
@@ -470,24 +483,18 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // BED is 0-based, htslib iterator is 0-based. No conversion needed.
         int64_t region_len = end - start;
-        if (region_len <= 0) {
-            continue;
-        }
+        if (region_len <= 0) continue;
 
-        // --- Reuse or reallocate the coverage buffer ---
         if (region_len > coverage_buf_size) {
             coverage_buf_size = region_len;
             coverage = (uint32_t *)realloc(coverage, coverage_buf_size * sizeof(uint32_t));
             if (!coverage) {
                 fprintf(stderr, "ERROR: coverage realloc failed\n");
-                exit(1); // Critical memory failure
+                exit(1);
             }
         }
-        // Always clear the buffer for the current region
         memset(coverage, 0, region_len * sizeof(uint32_t));
-
 
         int tid = bam_name2id(hdr, chrom);
         if (tid < 0) {
@@ -495,75 +502,69 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        // Create iterator for region
         hts_itr_t *iter = sam_itr_queryi(idx, tid, start, end);
-        if (!iter) {
-            // This is not an error; it just means no reads are in the region.
-        }
-
-        // This bitmask contains all the flags we want to skip
         const uint32_t flags_to_skip = BAM_FUNMAP | BAM_FSECONDARY | BAM_FQCFAIL | BAM_FDUP | BAM_FSUPPLEMENTARY;
 
-        // Read alignments in region
         bam1_t *b = bam_init1();
         if (iter) {
             while (sam_itr_next(in, iter, b) >= 0) {
                 if (b->core.flag & flags_to_skip) continue;
+                // skip if mapping quality is below threshold
+                if (b->core.qual < args.min_mapq) continue;
 
                 const char *read_name = bam_get_qname(b);
                 if (!read_name) continue;
 
+                read_cov_t *new_rc = generate_read_intervals(b, args.min_mapq, args.min_baseq);
+                if (!new_rc) continue;
+
                 int ret;
-                khiter_t k = kh_put(read2cov, hmap, strdup(read_name), &ret);
+                // First, check if the key already exists without inserting.
+                khiter_t k = kh_get(read2cov, hmap, read_name);
 
-                if (ret != 0) {
-                    read_cov_t *rc = (read_cov_t*)calloc(1, sizeof(read_cov_t));
-                    rc->start   = start;
-                    rc->end     = end;
-                    rc->len     = region_len;
-                    rc->cov_mask= (char*)calloc(region_len, sizeof(char));
-                    kh_value(hmap, k) = rc;
+                if (k != kh_end(hmap)) { // Key already exists, merge.
+                    read_cov_t *existing_rc = kh_value(hmap, k);
+                    for(size_t i = 0; i < new_rc->count; ++i) {
+                        add_interval(existing_rc, new_rc->intervals[i].start, new_rc->intervals[i].end);
+                    }
+                    merge_intervals_inplace(existing_rc);
+                    // Free the new_rc object since its data has been merged.
+                    free(new_rc->intervals);
+                    free(new_rc);
+                } else { // New key, so we insert it.
+                    char *key_copy = strdup(read_name);
+                    k = kh_put(read2cov, hmap, key_copy, &ret);
+                    kh_value(hmap, k) = new_rc;
                 }
-
-                read_cov_t *rc = kh_value(hmap, k);
-                add_read_coverage(b, rc, args.min_mapq, args.min_baseq);
             }
         }
-
         bam_destroy1(b);
         if (iter) hts_itr_destroy(iter);
 
-        // --- Finalize coverage (Pass 1) ---
-        for (khiter_t k2 = kh_begin(hmap); k2 != kh_end(hmap); ++k2) {
-            if (kh_exist(hmap, k2)) {
-                read_cov_t *rc = kh_value(hmap, k2);
-                for (int64_t i = 0; i < rc->len; i++) {
-                    if (rc->cov_mask[i]) {
-                        coverage[i]++;
+        // Finalize coverage from intervals and free memory
+        for (khiter_t k = kh_begin(hmap); k != kh_end(hmap); ++k) {
+            if (kh_exist(hmap, k)) {
+                read_cov_t *rc = kh_value(hmap, k);
+                for (size_t i = 0; i < rc->count; ++i) {
+                    for (int64_t pos = rc->intervals[i].start; pos < rc->intervals[i].end; ++pos) {
+                        if (pos >= start && pos < end) {
+                            coverage[pos - start]++;
+                        }
                     }
                 }
-            }
-        }
-
-        // --- Free hash map contents (Pass 2) ---
-        for (khiter_t k2 = kh_begin(hmap); k2 != kh_end(hmap); ++k2) {
-            if (kh_exist(hmap, k2)) {
-                read_cov_t *rc = kh_value(hmap, k2);
-                free(rc->cov_mask);
+                free(rc->intervals);
                 free(rc);
-                free((char*)kh_key(hmap, k2));
+                free((char*)kh_key(hmap, k));
             }
         }
-        kh_clear(read2cov, hmap); // Reset the hash map for the next region
+        kh_clear(read2cov, hmap);
         
-        // Compute coverage stats and print
         compute_and_print_stats(chrom, start, end, gene, info,
                                 coverage, region_len,
                                 args.cov_values, args.n_cov_values,
                                 outfp);
     }
 
-    // Cleanup
     free(coverage);
     kh_destroy(read2cov, hmap);
     if (outfp && outfp != stdout) fclose(outfp);
